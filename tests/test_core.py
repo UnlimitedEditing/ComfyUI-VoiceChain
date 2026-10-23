@@ -26,7 +26,7 @@ while True:
     done = new_cursor >= total - 0.05
     st = {"tag": core.TAG, "prompt": "p", "cursor": new_cursor, "total": total, "done": done, "step": step}
     out = os.path.join(work, f"out{step}.mp4")
-    core.finish(work, clip, prev, png, prev or src, st, out, total)
+    core.finish(work, clip, prev, [png], prev or src, st, out, total)
     rs, vsec = core.read_state(out)
     print(f"step {step}: frames {frames} cursor {cursor:.2f}->{new_cursor:.2f} video {vsec:.2f}s state {rs['cursor']:.2f} done {done}")
     assert abs(vsec - (total if done else new_cursor)) < 0.15, (vsec, new_cursor)
@@ -36,4 +36,4 @@ while True:
 info = core.probe(prev)
 for s in info["streams"]: print(s["index"], s["codec_type"], s["codec_name"], s.get("duration"), s.get("disposition",{}).get("attached_pic"))
 print("final format duration", info["format"]["duration"], "target", total)
-core.extract_cover(prev, os.path.join(work, "cover.png")); print("cover ok", os.path.getsize(os.path.join(work,"cover.png")))
+print("covers", [os.path.getsize(p) for p in core.extract_covers(prev, work)]); lf = core.last_frame(prev, os.path.join(work, "last.png")); print("last frame ok", os.path.getsize(lf))

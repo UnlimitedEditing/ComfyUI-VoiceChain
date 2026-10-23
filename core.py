@@ -77,15 +77,39 @@ def read_state(path):
     return st, vsec
 
 
-def extract_cover(path, out_png):
+def extract_covers(path, out_dir):
+    """All attached reference pictures, in stream order -> list of png paths."""
     info = probe(path)
+    out = []
     for s in info["streams"]:
         if s["codec_type"] == "video" and s.get("disposition", {}).get("attached_pic"):
-            r = _run(["ffmpeg", "-y", "-v", "error", "-i", path, "-map", f"0:{s['index']}", "-frames:v", "1", out_png])
+            p = os.path.join(out_dir, f"ref{len(out)}.png")
+            r = _run(["ffmpeg", "-y", "-v", "error", "-i", path, "-map", f"0:{s['index']}", "-frames:v", "1", p])
             if r.returncode:
                 raise RuntimeError(f"cover extract failed: {r.stderr[-300:]!r}")
-            return out_png
-    raise RuntimeError("the video has no attached reference image")
+            out.append(p)
+    if not out:
+        raise RuntimeError("the video has no attached reference image")
+    return out
+
+
+def last_frame(path, out_png):
+    """Last frame of the MAIN video stream. The container is longer than the video (it holds the full audio),
+    so seek from the video stream's own duration, never from the end of the file."""
+    vdur = None
+    for st in probe(path)["streams"]:
+        if st["codec_type"] == "video" and not st.get("disposition", {}).get("attached_pic"):
+            vdur = float(st.get("duration") or 0)
+            break
+    if not vdur:
+        raise RuntimeError("no main video stream")
+    if os.path.isfile(out_png):
+        os.remove(out_png)
+    r = _run(["ffmpeg", "-y", "-v", "error", "-ss", f"{max(0.0, vdur - 0.25):.3f}", "-i", path, "-map", "0:v:0",
+              "-update", "1", out_png])
+    if r.returncode or not os.path.isfile(out_png):
+        raise RuntimeError(f"last frame extract failed: {r.stderr[-300:]!r}")
+    return out_png
 
 
 def pick_frames(audio, cursor, total, max_frames=MAX_FRAMES):
@@ -144,12 +168,13 @@ def video_size(path):
     raise RuntimeError("no video stream")
 
 
-def finish(work, new_clip, prev_video, ref_png, audio_src, state, out_path, total):
+def finish(work, new_clip, prev_video, ref_pngs, audio_src, state, out_path, total):
     """Stitch new_clip after prev_video's main stream and write the self-contained mp4.
 
     audio_src: a file whose FIRST audio stream is the full source (original upload on step 1,
     the previous voicechain mp4 afterwards: its aac is stream-copied, never re-encoded).
     """
+    copy_audio = prev_video is not None
     parts = []
     if prev_video:
         prev_v = os.path.join(work, "prev_video.mp4")
@@ -167,15 +192,18 @@ def finish(work, new_clip, prev_video, ref_png, audio_src, state, out_path, tota
     if r.returncode:
         raise RuntimeError(f"concat failed: {r.stderr[-300:]!r}")
 
-    copy_audio = prev_video is not None
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", joined, "-i", audio_src, "-i", ref_png,
-           "-map", "0:v:0", "-map", "1:a:0", "-map", "2:v:0",
-           "-c:v:0", "copy", "-c:a", "copy" if copy_audio else "aac"]
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", joined, "-i", audio_src]
+    for p in ref_pngs:
+        cmd += ["-i", p]
+    cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+    for i in range(len(ref_pngs)):
+        cmd += ["-map", f"{2 + i}:v:0"]
+    cmd += ["-c:v:0", "copy", "-c:a", "copy" if copy_audio else "aac"]
     if not copy_audio:
         cmd += ["-b:a", "160k", "-ar", str(SR)]
-    cmd += ["-c:v:1", "png", "-disposition:v:1", "attached_pic",
-            "-metadata", "comment=" + json.dumps(state, separators=(",", ":")),
-            "-movflags", "+faststart"]
+    for i in range(len(ref_pngs)):
+        cmd += [f"-c:v:{1 + i}", "png", f"-disposition:v:{1 + i}", "attached_pic"]
+    cmd += ["-metadata", "comment=" + json.dumps(state, separators=(",", ":")), "-movflags", "+faststart"]
     if state.get("done"):
         cmd += ["-t", f"{total:.4f}"]
     cmd += [out_path]
