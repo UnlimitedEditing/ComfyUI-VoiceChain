@@ -88,18 +88,22 @@ def extract_cover(path, out_png):
     raise RuntimeError("the video has no attached reference image")
 
 
-def pick_frames(audio, cursor, total):
+def pick_frames(audio, cursor, total, max_frames=MAX_FRAMES):
     """Choose this step's frame count on the 17k+5 grid, ending at the quietest of the last few grid points.
 
-    audio: [2, N] full source. cursor/total in seconds. Returns frames (int).
+    audio: [2, N] full source. cursor/total in seconds. max_frames = the per-chunk cap (the workflow's `length`).
+    Returns frames (int).
     """
+    max_frames = max(MIN_FRAMES, ((int(max_frames) - 5) // 17) * 17 + 5)
     remaining = total - cursor
-    if remaining <= MAX_FRAMES / FPS + 0.3:
+    if remaining <= max_frames / FPS + 0.3:
         return snap_up(int(np.ceil(remaining * FPS)))
     mono = np.abs(audio[:, :]).mean(axis=0)
     win = int(0.04 * SR)
-    best, best_e = MAX_FRAMES, None
-    for f in (MAX_FRAMES, MAX_FRAMES - 17, MAX_FRAMES - 34):
+    best, best_e = max_frames, None
+    for f in (max_frames, max_frames - 17, max_frames - 34):
+        if f < MIN_FRAMES:
+            continue
         t = cursor + f / FPS
         c = int(t * SR)
         seg = mono[max(0, c - win): c + win]

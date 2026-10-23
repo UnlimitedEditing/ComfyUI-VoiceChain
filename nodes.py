@@ -50,7 +50,7 @@ class VoiceChainLoad:
             "ref_image": ("STRING", {"default": ""}),
             "audio": ("STRING", {"default": ""}),
             "prompt": ("STRING", {"default": "", "multiline": True}),
-            "max_chunk_seconds": ("FLOAT", {"default": 5.17, "min": 0.92, "max": 5.17, "step": 0.01}),
+            "max_chunk_frames": ("INT", {"default": 124, "min": 22, "max": 124, "step": 1}),
         }}
 
     RETURN_TYPES = ("IMAGE", "AUDIO", "INT", "STRING", "STRING")
@@ -58,10 +58,10 @@ class VoiceChainLoad:
     FUNCTION = "run"
     CATEGORY = "VoiceChain"
 
-    async def run(self, prev_video, ref_image, audio, prompt, max_chunk_seconds):
-        return await asyncio.to_thread(self._run, prev_video, ref_image, audio, prompt, max_chunk_seconds)
+    async def run(self, prev_video, ref_image, audio, prompt, max_chunk_frames):
+        return await asyncio.to_thread(self._run, prev_video, ref_image, audio, prompt, max_chunk_frames)
 
-    def _run(self, prev_video, ref_image, audio, prompt, max_chunk_seconds):
+    def _run(self, prev_video, ref_image, audio, prompt, max_chunk_frames):
         import torch
         work = tempfile.mkdtemp(prefix="voicechain_")
         prev = _resolve(prev_video) or None
@@ -89,10 +89,7 @@ class VoiceChainLoad:
             use_prompt = prompt.strip()
         full = core.decode_audio(audio_src)
         total = min(total, full.shape[1] / core.SR) if full.shape[1] else total
-        max_f = max(core.MIN_FRAMES, int(max_chunk_seconds * core.FPS))
-        frames = core.pick_frames(full, cursor, total)
-        if frames > max_f:   # user capped the chunk: largest 17k+5 value that fits
-            frames = max(core.MIN_FRAMES, ((max_f - 5) // 17) * 17 + 5)
+        frames = core.pick_frames(full, cursor, total, max_chunk_frames)
         seg = core.slice_audio(full, cursor, frames)
         ctx = {"prev": prev, "audio_src": audio_src, "ref_png": ref_png, "work": work, "cursor": cursor,
                "frames": frames, "total": total, "step": step, "prompt": use_prompt}

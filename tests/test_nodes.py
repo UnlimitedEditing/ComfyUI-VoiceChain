@@ -11,7 +11,7 @@ subprocess.run(["ffmpeg","-y","-v","error","-f","lavfi","-i","sine=f=300:d=9","-
 subprocess.run(["ffmpeg","-y","-v","error","-f","lavfi","-i","color=c=blue:s=200x120","-frames:v","1",os.path.join(inp,"r.png")],check=True)
 prev = ""
 for step in range(1, 5):
-    ref, aud, frames, prompt, ctx = asyncio.run(N["VoiceChainLoad"]().run(prev, "r.png" if step==1 else "", "a.mp3" if step==1 else "", "hello" if step==1 else "", 5.17))
+    ref, aud, frames, prompt, ctx = asyncio.run(N["VoiceChainLoad"]().run(prev, "r.png" if step==1 else "", "a.mp3" if step==1 else "", "hello" if step==1 else "", 124))
     print("step", step, "frames", frames, "audio", tuple(aud["waveform"].shape), "prompt", repr(prompt), "ref", tuple(ref.shape))
     imgs = torch.rand(frames, 120, 200, 3)
     r = asyncio.run(N["VoiceChainFinish"]().run(imgs, ctx, 24, "video/VC"))
@@ -21,5 +21,5 @@ for step in range(1, 5):
 else:
     sys.exit("never finished")
 try:
-    asyncio.run(N["VoiceChainLoad"]().run(prev, "", "", "", 5.17)); sys.exit("should have refused")
+    asyncio.run(N["VoiceChainLoad"]().run(prev, "", "", "", 124)); sys.exit("should have refused")
 except RuntimeError as e: print("refuses continuing a finished chain:", e)
