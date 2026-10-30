@@ -36,17 +36,23 @@ def _image_tensor(path):
 
 
 def _save_refs(names, work):
-    out = []
+    """-> (reference pngs, cue sheet or None). An image slot that holds a scene-audio cue sheet (pixel-data PNG) is the
+    cue sheet, not a reference picture."""
+    out, cues = [], None
     for n in names:
         path = _resolve(n)
         if not path:
+            continue
+        found = core.cues_from_png(path)
+        if found:
+            cues = found
             continue
         im = Image.open(path).convert("RGB")
         im.thumbnail((1024, 1024))
         p = os.path.join(work, f"given{len(out)}.png")
         im.save(p)
         out.append(p)
-    return out
+    return out, cues
 
 
 class VoiceChainLoad:
@@ -60,6 +66,11 @@ class VoiceChainLoad:
     anchor=1 also pins the chosen picture as the chunk's first frame (the cut lands on that angle); with a single
     angle, continuing chunks are pinned to the previous video's last frame instead (a smooth join).
     Outputs this step's audio slice and frame count (17k+5 grid, cut near a quiet point) plus ctx for Finish.
+
+    v5 (scene audio): pass the cue sheet PNG from scene-audio in any image slot (e.g. /image8:R<hash>) and the dry
+    dialogue as guide_audio (audio2). Then chunks end inside the pauses between turns, the angle follows who is speaking
+    (cue sheet speaker -> angle), the mp4 keeps two audio tracks (mix first, dialogue second) and audio_slice is the
+    dialogue, so H3 is conditioned on the dry voice while the mix is what the final file plays.
     """
 
     @classmethod
@@ -73,7 +84,7 @@ class VoiceChainLoad:
             "max_chunk_frames": ("INT", {"default": 124, "min": 22, "max": 124, "step": 1}),
             "anchor": ("INT", {"default": 1, "min": 0, "max": 1}),
         })
-        return {"required": req}
+        return {"required": req, "optional": {"guide_audio": ("STRING", {"default": ""})}}
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "AUDIO", "INT", "STRING", "STRING", "INT")
     RETURN_NAMES = ("ref_image", "first_frame", "audio_slice", "frames", "prompt", "ctx", "anchor_on")
@@ -81,16 +92,17 @@ class VoiceChainLoad:
     CATEGORY = "VoiceChain"
 
     async def run(self, prev_video, image1, image2, image3, image4, image5, image6, image7, image8,
-                  audio, prompt, max_chunk_frames, anchor):
+                  audio, prompt, max_chunk_frames, anchor, guide_audio=""):
         return await asyncio.to_thread(
             self._run, prev_video, [image1, image2, image3, image4, image5, image6, image7, image8],
-            audio, prompt, max_chunk_frames, anchor)
+            audio, prompt, max_chunk_frames, anchor, guide_audio)
 
-    def _run(self, prev_video, images, audio, prompt, max_chunk_frames, anchor):
+    def _run(self, prev_video, images, audio, prompt, max_chunk_frames, anchor, guide_audio=""):
         import torch
         work = tempfile.mkdtemp(prefix="voicechain_")
         prev = _resolve(prev_video) or None
-        given = _save_refs(images, work)
+        given, given_cues = _save_refs(images, work)
+        guide_path, cues, st = "", given_cues, {}
         if prev:
             st, vsec = core.read_state(prev)
             if st.get("done"):
@@ -104,6 +116,7 @@ class VoiceChainLoad:
                 os.makedirs(stored, exist_ok=True)
                 refs = core.extract_covers(prev, stored)
             audio_src = prev
+            cues = given_cues or st.get("cues")
             use_prompt = prompt.strip() or st.get("prompt", "")
             step = int(st.get("step", 0)) + 1
         else:
@@ -113,18 +126,27 @@ class VoiceChainLoad:
                                    "to continue a chain reply with the previous video (video1)")
             refs = given
             audio_src = audio_path
+            guide_path = _resolve(guide_audio)
             cursor, total, step = 0.0, core.audio_seconds(audio_path), 1
             use_prompt = prompt.strip()
+        has_guide = bool(st.get("has_guide")) if prev else bool(guide_path)
         full = core.decode_audio(audio_src)
         total = min(total, full.shape[1] / core.SR) if full.shape[1] else total
-        frames = core.pick_frames(full, cursor, total, max_chunk_frames)
-        seg = core.slice_audio(full, cursor, frames)
-        chosen = refs[(step - 1) % len(refs)]
+        frames = core.pick_frames_cued(cues, cursor, total, max_chunk_frames) if cues else None
+        if frames is None:
+            frames = core.pick_frames(full, cursor, total, max_chunk_frames)
+        if has_guide:   # H3 hears the dry dialogue; the mix (stream 0) is only delivered
+            dry = core.decode_audio(prev, stream=1) if prev else core.decode_audio(guide_path)
+            seg = core.slice_audio(dry, cursor, frames)
+        else:
+            seg = core.slice_audio(full, cursor, frames)
+        chosen = refs[core.chunk_angle(cues, cursor, len(refs), step)]
         first = chosen
         if prev and len(refs) == 1:
             first = core.last_frame(prev, os.path.join(work, "last.png"))
         ctx = {"prev": prev, "audio_src": audio_src, "ref_pngs": refs, "work": work, "cursor": cursor,
-               "frames": frames, "total": total, "step": step, "prompt": use_prompt, "n_refs": len(refs)}
+               "frames": frames, "total": total, "step": step, "prompt": use_prompt, "n_refs": len(refs),
+               "cues": cues, "has_guide": has_guide, "guide_src": guide_path}
         audio_out = {"waveform": torch.from_numpy(seg).unsqueeze(0), "sample_rate": core.SR}
         return (_image_tensor(chosen), _image_tensor(first), audio_out, int(frames), use_prompt, json.dumps(ctx),
                 int(anchor))
@@ -160,12 +182,17 @@ class VoiceChainFinish:
         done = new_cursor >= c["total"] - 0.05
         state = {"tag": core.TAG, "prompt": c["prompt"], "cursor": round(new_cursor, 4), "total": round(c["total"], 4),
                  "done": done, "step": c["step"], "n_refs": c["n_refs"]}
+        if c.get("cues"):
+            state["cues"] = c["cues"]
+        if c.get("has_guide"):
+            state["has_guide"] = True
         out_dir = folder_paths.get_output_directory()
         sub, prefix = os.path.split(filename_prefix)
         os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
         name = f"{prefix}_{int(time.time())}_{c['step']:03d}.mp4"
         out_path = os.path.join(out_dir, sub, name)
-        core.finish(c["work"], clip, c["prev"], c["ref_pngs"], c["audio_src"], state, out_path, c["total"])
+        core.finish(c["work"], clip, c["prev"], c["ref_pngs"], c["audio_src"], state, out_path, c["total"],
+                    c.get("guide_src") or None)
         return {"ui": {"images": [{"filename": name, "subfolder": sub, "type": "output"}], "animated": (True,)}}
 
 
