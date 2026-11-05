@@ -233,8 +233,30 @@ class AudioSpeechPrompt:
         return (out,)
 
 
+class OptionalImageLoad:
+    """Load an image by staged filename (Graydient image slots), or a 64x64 black placeholder when the slot is empty.
+    Outputs has_image (0/1) so a graph can switch a guide's strength instead of failing on a missing optional image."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"filename": ("STRING", {"default": ""})}}
+
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("image", "has_image")
+    FUNCTION = "run"
+    CATEGORY = "VoiceChain"
+
+    def run(self, filename):
+        import torch
+        path = _resolve(filename)
+        if not path:
+            return (torch.zeros((1, 64, 64, 3), dtype=torch.float32), 0)
+        return (_image_tensor(path), 1)
+
+
 NODE_CLASS_MAPPINGS = {"VoiceChainLoad": VoiceChainLoad, "VoiceChainFinish": VoiceChainFinish,
-                       "AudioSpeechPrompt": AudioSpeechPrompt}
+                       "AudioSpeechPrompt": AudioSpeechPrompt, "OptionalImageLoad": OptionalImageLoad}
 NODE_DISPLAY_NAME_MAPPINGS = {"VoiceChainLoad": "Voice Chain - Load / Continue",
                               "VoiceChainFinish": "Voice Chain - Stitch and Save",
-                              "AudioSpeechPrompt": "Audio Speech Prompt (Whisper)"}
+                              "AudioSpeechPrompt": "Audio Speech Prompt (Whisper)",
+                              "OptionalImageLoad": "Optional Image Load (placeholder if empty)"}
