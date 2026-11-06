@@ -234,29 +234,125 @@ class AudioSpeechPrompt:
 
 
 class OptionalImageLoad:
-    """Load an image by staged filename (Graydient image slots), or a 64x64 black placeholder when the slot is empty.
-    Outputs has_image (0/1) so a graph can switch a guide's strength instead of failing on a missing optional image."""
+    """Load an image by staged filename OR http(s) URL (Graydient fills either), or a 64x64 black placeholder when the slot
+    is empty. has_image (0/1) lets a graph switch a guide's strength instead of failing on a missing optional image.
+    required=1 raises a clear error instead of returning the placeholder."""
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"filename": ("STRING", {"default": ""})}}
+        return {"required": {"filename": ("STRING", {"default": ""})},
+                "optional": {"required": ("INT", {"default": 0, "min": 0, "max": 1})}}
 
     RETURN_TYPES = ("IMAGE", "INT")
     RETURN_NAMES = ("image", "has_image")
     FUNCTION = "run"
     CATEGORY = "VoiceChain"
 
-    def run(self, filename):
+    def run(self, filename, required=0):
         import torch
-        path = _resolve(filename)
+        name = (filename or "").strip()
+        if name.lower().startswith(("http://", "https://")):
+            import urllib.request
+            tmp = os.path.join(tempfile.mkdtemp(prefix="optimg_"), "img")
+            req = urllib.request.Request(name, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+                f.write(r.read())
+            return (_image_tensor(tmp), 1)
+        path = _resolve(name)
         if not path:
+            if required:
+                raise RuntimeError("the first image is required: reply to your picture (init image) when you send this")
             return (torch.zeros((1, 64, 64, 3), dtype=torch.float32), 0)
         return (_image_tensor(path), 1)
 
 
+class PinSchedule:
+    """Parse the prompt field into frame pins for up to 8 numbered pictures, plus the scene text.
+
+    Syntax, separated by '::' (or new lines):  N.F  = picture N on frame F of the SPEECH (frame 0 = first speech frame, the
+    0.5 s lead-in is added for you);  N.Ts = at T seconds (e.g. 2.4.5s);  N.end = last frame;  suffix ~s / ~c = snap to a
+    speaking peak / a pause (reserved, applied by AudioPinSnap). Anything else is the scene description. Pictures that are
+    present but not placed are spread evenly over the clip in slot order, the last one on the final frame.
+    Outputs idx1..idx8 (absolute frame positions in the generated clip, -1 = last frame) and the scene text."""
+
+    MAXPINS = 8
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        req = {"text": ("STRING", {"default": "", "multiline": True}),
+               "total_frames": ("INT", {"default": 121, "min": 9, "max": 4097}),
+               "pad_frames": ("INT", {"default": 12, "min": 0, "max": 96}),
+               "default_scene": ("STRING", {"default": "", "multiline": True})}
+        for i in range(1, cls.MAXPINS + 1):
+            req[f"has{i}"] = ("INT", {"default": 0, "min": 0, "max": 1})
+        return {"required": req}
+
+    RETURN_TYPES = tuple(["INT"] * 8 + ["INT"] * 8 + ["STRING"])
+    RETURN_NAMES = tuple([f"idx{i}" for i in range(1, 9)] + [f"mode{i}" for i in range(1, 9)] + ["scene"])
+    FUNCTION = "run"
+    CATEGORY = "VoiceChain"
+
+    @staticmethod
+    def parse(text, fps=24):
+        import re
+        pins, scene = {}, []
+        for seg in re.split(r"::|\n", text or ""):
+            seg = seg.strip()
+            if not seg:
+                continue
+            m = re.match(r"^(\d+)\.(end|\d+(?:\.\d+)?)(s?)(?:~([sc]))?$", seg, re.I)
+            if m and 1 <= int(m.group(1)) <= 8:
+                k, when, secs, snap = int(m.group(1)), m.group(2).lower(), m.group(3), (m.group(4) or "").lower()
+                if when == "end":
+                    f = -1
+                elif secs:
+                    f = int(round(float(when) * fps))
+                else:
+                    f = int(float(when))
+                pins[k] = (f, {"": 0, "s": 1, "c": 2}[snap])
+            else:
+                scene.append(seg)
+        return pins, " ".join(scene)
+
+    @staticmethod
+    def place(pins, present, total, pad):
+        last = total - 1
+        m = len(present)
+        idx = {}
+        for r, k in enumerate(present, 1):
+            if k in pins:
+                f = pins[k][0]
+                idx[k] = last if f < 0 else min(max(f + pad, pad + 1), last)
+            else:
+                idx[k] = last if r == m else min(pad + max(int(round(r * (last - pad) / m)), 1), last)
+        # keep pins at least 8 frames apart (latent step), moving the later one forward
+        order = sorted(present, key=lambda k: (idx[k], k))
+        for a, b in zip(order, order[1:]):
+            if idx[b] - idx[a] < 8:
+                idx[b] = min(idx[a] + 8, last)
+        return idx
+
+    def run(self, text, total_frames, pad_frames, default_scene,
+            has1, has2, has3, has4, has5, has6, has7, has8):
+        pins, scene = self.parse(text)
+        has = [has1, has2, has3, has4, has5, has6, has7, has8]
+        present = [k for k in range(1, 9) if has[k - 1]]
+        idx = self.place(pins, present, total_frames, pad_frames)
+        last = total_frames - 1
+        out_idx, out_mode = [], []
+        for k in range(1, 9):
+            v = idx.get(k, last)
+            out_idx.append(-1 if v >= last else int(v))
+            out_mode.append(pins.get(k, (0, 0))[1])
+        print(f"[VoiceChain] PinSchedule present={present} pins={pins} idx={out_idx} scene={scene[:80]!r}")
+        return tuple(out_idx + out_mode + [scene or default_scene])
+
+
 NODE_CLASS_MAPPINGS = {"VoiceChainLoad": VoiceChainLoad, "VoiceChainFinish": VoiceChainFinish,
-                       "AudioSpeechPrompt": AudioSpeechPrompt, "OptionalImageLoad": OptionalImageLoad}
+                       "AudioSpeechPrompt": AudioSpeechPrompt, "OptionalImageLoad": OptionalImageLoad,
+                       "PinSchedule": PinSchedule}
 NODE_DISPLAY_NAME_MAPPINGS = {"VoiceChainLoad": "Voice Chain - Load / Continue",
                               "VoiceChainFinish": "Voice Chain - Stitch and Save",
                               "AudioSpeechPrompt": "Audio Speech Prompt (Whisper)",
-                              "OptionalImageLoad": "Optional Image Load (placeholder if empty)"}
+                              "OptionalImageLoad": "Optional Image Load (placeholder if empty)",
+                              "PinSchedule": "Pin Schedule (parse N.frame :: ...)"}
