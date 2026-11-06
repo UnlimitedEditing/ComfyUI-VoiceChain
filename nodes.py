@@ -285,7 +285,7 @@ class PinSchedule:
                "default_scene": ("STRING", {"default": "", "multiline": True})}
         for i in range(1, cls.MAXPINS + 1):
             req[f"has{i}"] = ("INT", {"default": 0, "min": 0, "max": 1})
-        return {"required": req}
+        return {"required": req, "optional": {"fps": ("INT", {"default": 24, "min": 8, "max": 60})}}
 
     RETURN_TYPES = tuple(["INT"] * 8 + ["INT"] * 8 + ["STRING"])
     RETURN_NAMES = tuple([f"idx{i}" for i in range(1, 9)] + [f"mode{i}" for i in range(1, 9)] + ["scene"])
@@ -333,8 +333,8 @@ class PinSchedule:
         return idx
 
     def run(self, text, total_frames, pad_frames, default_scene,
-            has1, has2, has3, has4, has5, has6, has7, has8):
-        pins, scene = self.parse(text)
+            has1, has2, has3, has4, has5, has6, has7, has8, fps=24):
+        pins, scene = self.parse(text, fps)
         has = [has1, has2, has3, has4, has5, has6, has7, has8]
         present = [k for k in range(1, 9) if has[k - 1]]
         idx = self.place(pins, present, total_frames, pad_frames)
@@ -463,7 +463,8 @@ class VideoGrade:
     def INPUT_TYPES(cls):
         return {"required": {"images": ("IMAGE",), "preset": ("STRING", {"default": "natural"}),
                              "strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05}),
-                             "smooth": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1})}}
+                             "smooth": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1})},
+                "optional": {"fps": ("INT", {"default": 24, "min": 8, "max": 60})}}
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("images",)
@@ -476,14 +477,14 @@ class VideoGrade:
         base = np.array([[50.0, 0.0, 0.0]])
         return (PinColorMatch._to_rgb(lab) - PinColorMatch._to_rgb(base))[0].astype(np.float32)
 
-    def run(self, images, preset="natural", strength=0.6, smooth=1.0):
+    def run(self, images, preset="natural", strength=0.6, smooth=1.0, fps=24):
         import torch
         n = images.shape[0]
         out = images.clone()
         rgb = out[..., :3]
         if smooth > 0 and n > 2:
             mean = rgb.reshape(n, -1, 3).mean(1)                                   # (n, 3)
-            win = max(1, int(round(24 * smooth)) // 2 * 2 + 1)
+            win = max(1, int(round(fps * smooth)) // 2 * 2 + 1)
             pad = win // 2
             padded = torch.cat([mean[1:pad + 1].flip(0), mean, mean[-pad - 1:-1].flip(0)], 0) if pad < n else mean
             kern = torch.ones(1, 1, win, dtype=mean.dtype) / win
