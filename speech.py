@@ -24,6 +24,31 @@ def _model_ref(size):
     return size
 
 
+def _read_wav_16k(path):
+    """Mono 16 kHz float32 samples from a PCM16 wav, without PyAV (faster-whisper's own decoder calls av.open(metadata_errors=...),
+    which the platform's PyAV rejects: that silently killed every transcript). Raises on anything that is not a PCM16 wav."""
+    import wave
+    import numpy as np
+    with wave.open(path) as w:
+        sr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
+        raw = w.readframes(w.getnframes())
+    if sw != 2:
+        raise ValueError(f"not 16-bit pcm ({sw * 8} bit)")
+    x = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if ch > 1:
+        x = x.reshape(-1, ch).mean(1)
+    if sr != 16000:
+        try:
+            from math import gcd
+            from scipy.signal import resample_poly
+            g = gcd(16000, sr)
+            x = resample_poly(x, 16000 // g, sr // g).astype(np.float32)
+        except Exception:
+            n = int(len(x) * 16000 / sr)
+            x = np.interp(np.linspace(0, len(x) - 1, n), np.arange(len(x)), x).astype(np.float32)
+    return x
+
+
 def transcribe(path, size="small"):
     """-> [[word, start, end], ...] in seconds, [] on any failure (the prompt then just has no quoted words)."""
     try:
@@ -43,7 +68,12 @@ def transcribe(path, size="small"):
     for device, ctype in (("cuda", "float16"), ("cpu", "int8")):
         try:
             model = WhisperModel(ref, device=device, compute_type=ctype)
-            segs, info = model.transcribe(path, word_timestamps=True, vad_filter=True, beam_size=1)
+            try:
+                audio_in = _read_wav_16k(path)
+            except Exception as e:
+                print(f"[VoiceChain] wav read failed ({e}); letting faster-whisper decode {path}")
+                audio_in = path
+            segs, info = model.transcribe(audio_in, word_timestamps=True, vad_filter=True, beam_size=1)
             words = []
             for s in segs:
                 for w in (s.words or []):
