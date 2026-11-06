@@ -7,7 +7,7 @@ import time
 import numpy as np
 from PIL import Image
 
-from . import core, speech
+from . import core, snap, speech
 
 
 def _input_dir():
@@ -348,11 +348,46 @@ class PinSchedule:
         return tuple(out_idx + out_mode + [scene or default_scene])
 
 
+class AudioPinSnap:
+    """Snap pins marked ~s (speaking mouth shape) to the nearest speech peak and pins marked ~c (closed mouth) to the nearest
+    pause of the SPEECH audio, so framed events land on the waveform. idx/mode come from PinSchedule; unmarked pins and the
+    last-frame pin (-1) pass through unchanged."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        req = {"audio": ("AUDIO",), "total_frames": ("INT", {"default": 121, "min": 9, "max": 4097}),
+               "pad_frames": ("INT", {"default": 12, "min": 0, "max": 96})}
+        for i in range(1, 9):
+            req[f"idx{i}"] = ("INT", {"default": -1, "min": -1, "max": 4097})
+        for i in range(1, 9):
+            req[f"mode{i}"] = ("INT", {"default": 0, "min": 0, "max": 2})
+        return {"required": req}
+
+    RETURN_TYPES = tuple(["INT"] * 8)
+    RETURN_NAMES = tuple(f"idx{i}" for i in range(1, 9))
+    FUNCTION = "run"
+    CATEGORY = "VoiceChain"
+
+    def run(self, audio, total_frames, pad_frames, idx1, idx2, idx3, idx4, idx5, idx6, idx7, idx8,
+            mode1, mode2, mode3, mode4, mode5, mode6, mode7, mode8):
+        idx = [idx1, idx2, idx3, idx4, idx5, idx6, idx7, idx8]
+        modes = [mode1, mode2, mode3, mode4, mode5, mode6, mode7, mode8]
+        if not any(modes):
+            return tuple(idx)
+        wave = audio["waveform"].detach().cpu().float().numpy()
+        wave = wave[0] if wave.ndim == 3 else wave
+        env = snap.envelope(wave, int(audio["sample_rate"]))
+        out = snap.snap_indices(idx, modes, env, pad_frames, total_frames)
+        print(f"[VoiceChain] AudioPinSnap {idx} -> {out} (modes {modes})")
+        return tuple(out)
+
+
 NODE_CLASS_MAPPINGS = {"VoiceChainLoad": VoiceChainLoad, "VoiceChainFinish": VoiceChainFinish,
                        "AudioSpeechPrompt": AudioSpeechPrompt, "OptionalImageLoad": OptionalImageLoad,
-                       "PinSchedule": PinSchedule}
+                       "PinSchedule": PinSchedule, "AudioPinSnap": AudioPinSnap}
 NODE_DISPLAY_NAME_MAPPINGS = {"VoiceChainLoad": "Voice Chain - Load / Continue",
                               "VoiceChainFinish": "Voice Chain - Stitch and Save",
                               "AudioSpeechPrompt": "Audio Speech Prompt (Whisper)",
                               "OptionalImageLoad": "Optional Image Load (placeholder if empty)",
-                              "PinSchedule": "Pin Schedule (parse N.frame :: ...)"}
+                              "PinSchedule": "Pin Schedule (parse N.frame :: ...)",
+                              "AudioPinSnap": "Audio Pin Snap (~s peak / ~c pause)"}
