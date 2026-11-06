@@ -32,6 +32,14 @@ def transcribe(path, size="small"):
         print(f"[VoiceChain] faster-whisper unavailable ({e}); no transcript")
         return []
     ref = _model_ref(size)
+    try:
+        import importlib.metadata as md
+        vers = {p: md.version(p) for p in ("faster-whisper", "ctranslate2", "huggingface_hub", "tokenizers", "onnxruntime", "av")
+                if _has(p)}
+        listing = sorted(os.listdir(ref)) if os.path.isdir(ref) else "(not a local dir)"
+        print(f"[VoiceChain] whisper ref={ref!r} files={listing} versions={vers}")
+    except Exception as e:
+        print(f"[VoiceChain] whisper diagnostics failed: {e}")
     for device, ctype in (("cuda", "float16"), ("cpu", "int8")):
         try:
             model = WhisperModel(ref, device=device, compute_type=ctype)
@@ -45,8 +53,19 @@ def transcribe(path, size="small"):
             print(f"[VoiceChain] whisper {size} on {device}: {len(words)} words, language={info.language}")
             return words
         except Exception as e:
+            import traceback
             print(f"[VoiceChain] whisper on {device} failed: {e}")
+            print("[VoiceChain] whisper traceback:\n" + "".join(traceback.format_exc().splitlines(True)[-14:]))
     return []
+
+
+def _has(pkg):
+    try:
+        import importlib.metadata as md
+        md.version(pkg)
+        return True
+    except Exception:
+        return False
 
 
 def words_in(words, start, end):
