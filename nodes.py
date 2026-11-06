@@ -382,12 +382,69 @@ class AudioPinSnap:
         return tuple(out)
 
 
+class PinColorMatch:
+    """Deterministic white-balance / exposure match of an edited picture to a reference picture (numpy only, no model).
+
+    i2i edits drift in white balance and brightness; used as guide frames those drifts make the video flicker. This shifts the
+    picture's LAB mean (a, b = colour cast, L = exposure) onto the reference's, and scales its spread (contrast / saturation)
+    toward the reference's with a clamped gain, so the correction can never blow a picture out. strength 0 = untouched, 1 = full.
+    enable=0 (no picture in that slot) returns the input unchanged."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"image": ("IMAGE",), "reference": ("IMAGE",),
+                             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                             "enable": ("INT", {"default": 1, "min": 0, "max": 1})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "run"
+    CATEGORY = "VoiceChain"
+
+    @staticmethod
+    def _to_lab(rgb):
+        lin = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+        m = np.array([[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]])
+        xyz = (lin @ m.T) / np.array([0.95047, 1.0, 1.08883])
+        f = np.where(xyz > 216 / 24389, np.cbrt(xyz), (24389 / 27 * xyz + 16) / 116)
+        return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], -1)
+
+    @staticmethod
+    def _to_rgb(lab):
+        fy = (lab[..., 0] + 16) / 116
+        f = np.stack([fy + lab[..., 1] / 500, fy, fy - lab[..., 2] / 200], -1)
+        xyz = np.where(f ** 3 > 216 / 24389, f ** 3, (116 * f - 16) / (24389 / 27)) * np.array([0.95047, 1.0, 1.08883])
+        m = np.linalg.inv(np.array([[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]]))
+        lin = np.clip(xyz @ m.T, 0.0, 1.0)
+        return np.where(lin <= 0.0031308, lin * 12.92, 1.055 * lin ** (1 / 2.4) - 0.055)
+
+    def run(self, image, reference, strength=1.0, enable=1):
+        import torch
+        if not enable or strength <= 0:
+            return (image,)
+        ref = self._to_lab(np.clip(reference[0, ..., :3].cpu().numpy().astype(np.float64), 0, 1))
+        r_mean, r_std = ref.reshape(-1, 3).mean(0), ref.reshape(-1, 3).std(0)
+        out = []
+        for i in range(image.shape[0]):
+            src = np.clip(image[i, ..., :3].cpu().numpy().astype(np.float64), 0, 1)
+            lab = self._to_lab(src)
+            s_mean, s_std = lab.reshape(-1, 3).mean(0), lab.reshape(-1, 3).std(0)
+            gain = np.clip(r_std / np.maximum(s_std, 1e-3), 0.8, 1.25)
+            fixed = (lab - s_mean) * gain + r_mean
+            fixed = lab + (fixed - lab) * float(strength)
+            out.append(torch.from_numpy(self._to_rgb(fixed).astype(np.float32)))
+        res = torch.stack(out, 0)
+        print(f"[VoiceChain] PinColorMatch LAB mean {np.round(s_mean, 1).tolist()} -> {np.round(r_mean, 1).tolist()} strength {strength}")
+        return (res.to(image.dtype),)
+
+
 NODE_CLASS_MAPPINGS = {"VoiceChainLoad": VoiceChainLoad, "VoiceChainFinish": VoiceChainFinish,
                        "AudioSpeechPrompt": AudioSpeechPrompt, "OptionalImageLoad": OptionalImageLoad,
-                       "PinSchedule": PinSchedule, "AudioPinSnap": AudioPinSnap}
+                       "PinSchedule": PinSchedule, "AudioPinSnap": AudioPinSnap, "PinColorMatch": PinColorMatch}
 NODE_DISPLAY_NAME_MAPPINGS = {"VoiceChainLoad": "Voice Chain - Load / Continue",
                               "VoiceChainFinish": "Voice Chain - Stitch and Save",
                               "AudioSpeechPrompt": "Audio Speech Prompt (Whisper)",
                               "OptionalImageLoad": "Optional Image Load (placeholder if empty)",
                               "PinSchedule": "Pin Schedule (parse N.frame :: ...)",
-                              "AudioPinSnap": "Audio Pin Snap (~s peak / ~c pause)"}
+                              "AudioPinSnap": "Audio Pin Snap (~s peak / ~c pause)",
+                              "PinColorMatch": "Pin Colour Match (white balance to reference)"}
