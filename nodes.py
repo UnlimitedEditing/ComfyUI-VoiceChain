@@ -438,13 +438,94 @@ class PinColorMatch:
         return (res.to(image.dtype),)
 
 
+# (shadow a,b | highlight a,b) LAB tint at the start and the end of the clip, plus saturation. Shadows and highlights are
+# always complementary hues, so every preset lands in a harmonious range. The tint glides start -> end over the clip.
+GRADE_PRESETS = {
+    "natural":    {"s0": (0, 0), "h0": (0, 0), "s1": (0, 0), "h1": (0, 0), "sat": 1.0},
+    "tealorange": {"s0": (-6, -9), "h0": (5, 12), "s1": (-6, -9), "h1": (5, 12), "sat": 1.05},
+    "goldenhour": {"s0": (-3, -8), "h0": (4, 16), "s1": (2, -10), "h1": (6, 10), "sat": 1.05},
+    "noir":       {"s0": (-2, -8), "h0": (0, 2), "s1": (-2, -8), "h1": (0, 2), "sat": 0.55},
+    "dream":      {"s0": (9, -6), "h0": (-6, 8), "s1": (4, -9), "h1": (-9, 4), "sat": 0.85},
+    "sunsetfade": {"s0": (-6, -9), "h0": (5, 12), "s1": (10, -6), "h1": (8, 16), "sat": 1.1},
+}
+
+
+class VideoGrade:
+    """Deterministic post grade for a decoded video batch (no model, cheap tensor ops).
+
+    1. smooth: each frame's average colour is low-passed over ~1 s so fast colour flicker / white-balance jumps vanish while slow
+       evolution stays (smooth 0 = off).
+    2. preset: a soft split-tone (shadows and highlights get complementary hues) that glides from a start to an end tint over the clip.
+       'auto' tints highlights toward the clip's own dominant hue and shadows toward its complement. Unknown name = natural.
+    3. strength 0..1 scales the saturation change and the tint (0 = only the smoothing)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE",), "preset": ("STRING", {"default": "natural"}),
+                             "strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.05}),
+                             "smooth": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "run"
+    CATEGORY = "VoiceChain"
+
+    @staticmethod
+    def _rgb_offset(da, db):
+        lab = np.array([[50.0, da, db]])
+        base = np.array([[50.0, 0.0, 0.0]])
+        return (PinColorMatch._to_rgb(lab) - PinColorMatch._to_rgb(base))[0].astype(np.float32)
+
+    def run(self, images, preset="natural", strength=0.6, smooth=1.0):
+        import torch
+        n = images.shape[0]
+        out = images.clone()
+        rgb = out[..., :3]
+        if smooth > 0 and n > 2:
+            mean = rgb.reshape(n, -1, 3).mean(1)                                   # (n, 3)
+            win = max(1, int(round(24 * smooth)) // 2 * 2 + 1)
+            pad = win // 2
+            padded = torch.cat([mean[1:pad + 1].flip(0), mean, mean[-pad - 1:-1].flip(0)], 0) if pad < n else mean
+            kern = torch.ones(1, 1, win, dtype=mean.dtype) / win
+            sm = torch.nn.functional.conv1d(padded.t().unsqueeze(1), kern).squeeze(1).t()
+            if sm.shape[0] == n:
+                rgb += (sm - mean).view(n, 1, 1, 3).to(rgb.dtype)
+        name = (preset or "natural").strip().lower()
+        p = GRADE_PRESETS.get(name)
+        if name == "auto":
+            m = np.clip(rgb.reshape(-1, 3).mean(0).cpu().numpy().astype(np.float64), 0, 1)[None]
+            lab = PinColorMatch._to_lab(m)[0]
+            v = np.array([lab[1], lab[2]]); v = v / (np.linalg.norm(v) + 1e-6) * 12.0
+            p = {"s0": tuple(-v), "h0": tuple(v), "s1": tuple(-v), "h1": tuple(v), "sat": 1.0}
+        if p and strength > 0 and name != "natural":
+            offs = {k: torch.from_numpy(self._rgb_offset(*p[k])) for k in ("s0", "h0", "s1", "h1")}
+            sat = 1.0 + (p["sat"] - 1.0) * float(strength)
+            for i in range(n):
+                t = i / max(n - 1, 1)
+                t = t * t * (3 - 2 * t)
+                sh = offs["s0"] * (1 - t) + offs["s1"] * t
+                hi = offs["h0"] * (1 - t) + offs["h1"] * t
+                fr = rgb[i]
+                y = (fr * torch.tensor([0.2126, 0.7152, 0.0722], dtype=fr.dtype)).sum(-1, keepdim=True)
+                w = ((y - 0.25) / 0.5).clamp(0, 1)
+                w = w * w * (3 - 2 * w)                                           # 0 = shadow, 1 = highlight
+                fr = y + (fr - y) * sat
+                fr = fr + (1 - w) * sh.to(fr.dtype) * float(strength) + w * hi.to(fr.dtype) * float(strength)
+                rgb[i] = fr
+        out[..., :3] = rgb.clamp(0, 1)
+        print(f"[VoiceChain] VideoGrade preset={name if p else 'natural'} strength={strength} smooth={smooth} frames={n}")
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {"VoiceChainLoad": VoiceChainLoad, "VoiceChainFinish": VoiceChainFinish,
                        "AudioSpeechPrompt": AudioSpeechPrompt, "OptionalImageLoad": OptionalImageLoad,
-                       "PinSchedule": PinSchedule, "AudioPinSnap": AudioPinSnap, "PinColorMatch": PinColorMatch}
+                       "PinSchedule": PinSchedule, "AudioPinSnap": AudioPinSnap, "PinColorMatch": PinColorMatch,
+                       "VideoGrade": VideoGrade}
 NODE_DISPLAY_NAME_MAPPINGS = {"VoiceChainLoad": "Voice Chain - Load / Continue",
                               "VoiceChainFinish": "Voice Chain - Stitch and Save",
                               "AudioSpeechPrompt": "Audio Speech Prompt (Whisper)",
                               "OptionalImageLoad": "Optional Image Load (placeholder if empty)",
                               "PinSchedule": "Pin Schedule (parse N.frame :: ...)",
                               "AudioPinSnap": "Audio Pin Snap (~s peak / ~c pause)",
-                              "PinColorMatch": "Pin Colour Match (white balance to reference)"}
+                              "PinColorMatch": "Pin Colour Match (white balance to reference)",
+                              "VideoGrade": "Video Grade (smooth colour + complementary split-tone presets)"}
